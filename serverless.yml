@@ -1,0 +1,201 @@
+service: alegra-sync-bridge
+
+custom:
+  manifestBucketName: ${self:service}-manifests-${sls:stage}
+  idempotencyTable: ${self:service}-idempotency-${sls:stage}
+  salesTable: ${self:service}-sales-${sls:stage}
+  connectionsTable: ${self:service}-connections-${sls:stage}
+
+org: silentgrasshopper
+app: alegra-sync-bridge-app
+
+plugins:
+  - serverless-jetpack
+  - serverless-offline
+  - serverless-offline-sqs
+
+provider:
+  name: aws
+  runtime: nodejs22.x
+  region: us-east-1
+  logRetentionInDays: 3
+  apiGateway:
+    binaryMediaTypes:
+      - 'multipart/form-data'
+      - 'image/jpeg'
+  environment:
+    NODE_ENV: ${env:NODE_ENV}
+    PORT: ${env:PORT}
+    OPENAI_API_KEY: ${env:OPENAI_API_KEY}
+    OPENAI_BASE_URL: ${env:OPENAI_BASE_URL}
+    OPENAI_MODEL: ${env:OPENAI_MODEL}
+    APP_AWS_REGION: ${env:APP_AWS_REGION}
+    CURRENCY_CONVERTER_API_KEY: ${env:CURRENCY_CONVERTER_API_KEY}
+    CURRENCY_CONVERTER_API_URL: ${env:CURRENCY_CONVERTER_API_URL}
+    SOCKET_BASE_URL: ${env:SOCKET_BASE_URL}
+    IDEMPOTENCY_TABLE: ${self:custom.idempotencyTable}
+    SALES_TABLE: ${self:custom.salesTable}
+    CONNECTIONS_TABLE: ${self:custom.connectionsTable}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+          Resource: 'arn:aws:s3:::${self:custom.manifestBucketName}/*'
+
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource: !GetAtt ProcessingQueue.Arn
+
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+          Resource: !GetAtt IdempotencyTable.Arn
+
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+          Resource: !GetAtt SalesTable.Arn
+
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+          Resource: !GetAtt ConnectionsTable.Arn
+
+        - Effect: Allow
+          Action:
+            - 'execute-api:ManageConnections'
+          Resource: 'arn:aws:execute-api:${aws:region}:${aws:accountId}:*/${sls:stage}/POST/@connections/*'
+
+functions:
+  ingestion-api:
+    handler: dist/entrypoints/serverless.handler
+    events:
+      - http:
+          method: post
+          path: /ingest/register
+          cors: true
+      - http:
+          method: post
+          path: /ingest/{transactionId}
+          cors: true
+  sync-processor:
+    handler: dist/entrypoints/sync-processor.handler
+    timeout: 60
+    memorySize: 512
+    events:
+      - sqs:
+          arn: !GetAtt ProcessingQueue.Arn
+          batchSize: 1
+  websocket-handler:
+    handler: dist/entrypoints/websocket-lambda.handler
+    events:
+      - websocket:
+          route: $connect
+      - websocket:
+          route: $disconnect
+      - websocket:
+          route: register
+      - websocket:
+          route: $default
+
+resources:
+  Resources:
+    ManifestBucket:
+      Type: AWS::S3::Bucket
+      DependsOn: S3ToSqsPolicy
+      Properties:
+        BucketName: ${self:custom.manifestBucketName}
+        NotificationConfiguration:
+          QueueConfigurations:
+            - Event: s3:ObjectCreated:*
+              Queue: !GetAtt ProcessingQueue.Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: suffix
+                      Value: manifest.json
+
+    ProcessingQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-processing-queue-${sls:stage}
+        VisibilityTimeout: 60
+        MessageRetentionPeriod: 86400
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt ProcessingDLQ.Arn
+          maxReceiveCount: 3
+
+    ProcessingDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-dlq-${sls:stage}
+        MessageRetentionPeriod: 1209600
+
+    S3ToSqsPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref ProcessingQueue
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: s3.amazonaws.com
+              Action: 'sqs:SendMessage'
+              Resource: !GetAtt ProcessingQueue.Arn
+              Condition:
+                ArnLike:
+                  aws:SourceArn: !Sub 'arn:aws:s3:::${self:custom.manifestBucketName}'
+
+    IdempotencyTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.idempotencyTable}
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    SalesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.salesTable}
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+
+    ConnectionsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.connectionsTable}
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
